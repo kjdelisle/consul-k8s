@@ -110,6 +110,12 @@ type Handler struct {
 	// registrations. It will be overridden by a specific annotation.
 	DefaultProtocol string
 
+	// Envoy certificate materials used for connecting to Consul (paths to PEM-encoded files)
+	CertVolume      string // Secret volume to mount to the pod (must exist within the pod namespace).
+	EnvoyCAFile     string // CA cert filename within the secret volume.
+	EnvoyClientCert string // TLS client cert filename within the secret volume.
+	EnvoyClientKey  string // TLS client key filename within the secret volume.
+
 	// Log
 	Log hclog.Logger
 }
@@ -217,6 +223,18 @@ func (h *Handler) Mutate(req *v1beta1.AdmissionRequest) *v1beta1.AdmissionRespon
 		pod.Spec.Volumes,
 		[]corev1.Volume{h.containerVolume()},
 		"/spec/volumes")...)
+
+	if h.CertVolume != "" {
+		patches = append(patches, addVolume(
+			pod.Spec.Volumes,
+			[]corev1.Volume{
+				h.envoySecretVolume(h.CertVolume,
+					h.EnvoyCAFile,
+					h.EnvoyClientCert,
+					h.EnvoyClientKey),
+			},
+			"/spec/volumes")...)
+	}
 
 	// Add the upstream services as environment variables for easy
 	// service discovery.
@@ -422,6 +440,40 @@ func findServiceAccountVolumeMount(pod *corev1.Pod) (corev1.VolumeMount, error) 
 	// Return an error if volumeMount is still empty
 	if (corev1.VolumeMount{}) == volumeMount {
 		return volumeMount, errors.New("Unable to find service account token volumeMount")
+	}
+
+	return volumeMount, nil
+}
+
+func findCertSecretVolumeMount(pod *corev1.Pod, volName string) (corev1.VolumeMount, error) {
+	var volumeMount corev1.VolumeMount
+	var volume corev1.Volume
+	for _, v := range pod.Spec.Volumes {
+		// Check if the volume is a Secret or a ConfigMap
+		// (ConfigMap could still make sense if they're only mounting a CA cert...)
+		if v.Secret != nil && v.Secret.SecretName == volName {
+			volume = v
+			break
+		} else if v.ConfigMap != nil && v.ConfigMap.Name == volName {
+			volume = v
+			break
+		}
+	}
+	for _, container := range pod.Spec.Containers {
+		for _, vm := range container.VolumeMounts {
+			if vm.MountPath == "/consul/connect-inject/tls" {
+				volumeMount = vm
+				break
+			}
+		}
+	}
+
+	if (corev1.Volume{}) == volume {
+		return volumeMount, errors.New("Unable to find TLS volume for Connect on the Pod specification")
+	}
+
+	if (corev1.VolumeMount{}) == volumeMount {
+		return volumeMount, errors.New("Unable to find TLS mount for Connect on the Pod containers")
 	}
 
 	return volumeMount, nil

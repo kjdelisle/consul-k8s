@@ -21,6 +21,10 @@ type initContainerCommandData struct {
 	Upstreams       []initContainerCommandUpstreamData
 	Tags            string
 	Meta            map[string]string
+	CertVolume      string // Secret volume to mount to the pod (must exist within the pod namespace).
+	EnvoyCAFile     string // CA cert filename within the secret volume.
+	EnvoyClientCert string // TLS client cert filename within the secret volume.
+	EnvoyClientKey  string // TLS client key filename within the secret volume.
 }
 
 type initContainerCommandUpstreamData struct {
@@ -41,6 +45,10 @@ func (h *Handler) containerInit(pod *corev1.Pod) (corev1.Container, error) {
 		ServiceName:     pod.Annotations[annotationService],
 		ServiceProtocol: protocol,
 		AuthMethod:      h.AuthMethod,
+		CertVolume:      h.CertVolume,
+		EnvoyCAFile:     h.EnvoyCAFile,
+		EnvoyClientCert: h.EnvoyClientCert,
+		EnvoyClientKey:  h.EnvoyClientKey,
 		CentralConfig:   h.CentralConfig,
 	}
 	if data.ServiceName == "" {
@@ -135,6 +143,15 @@ func (h *Handler) containerInit(pod *corev1.Pod) (corev1.Container, error) {
 		volMounts = append(volMounts, saTokenVolumeMount)
 	}
 
+	if h.CertVolume != "" {
+		certVolumeMount, err := findCertSecretVolumeMount(pod, h.CertVolume)
+		if err != nil {
+			return corev1.Container{}, err
+		}
+
+		volMounts = append(volMounts, certVolumeMount)
+	}
+
 	// Render the command
 	var buf bytes.Buffer
 	tpl := template.Must(template.New("root").Parse(strings.TrimSpace(
@@ -181,8 +198,13 @@ func (h *Handler) containerInit(pod *corev1.Pod) (corev1.Container, error) {
 // initContainerCommandTpl is the template for the command executed by
 // the init container.
 const initContainerCommandTpl = `
+{{- if .CertVolume }}
+export CONSUL_HTTP_ADDR="https://${HOST_IP}:8501"
+export CONSUL_GRPC_ADDR="https://${HOST_IP}:8502"
+{{- else }}
 export CONSUL_HTTP_ADDR="${HOST_IP}:8500"
 export CONSUL_GRPC_ADDR="${HOST_IP}:8502"
+{{- end }}
 
 # Register the service. The HCL is stored in the volume so that
 # the preStop hook can access it to deregister the service.
@@ -206,7 +228,7 @@ services {
 
   proxy {
     destination_service_name = "{{ .ServiceName }}"
-    destination_service_id = "{{ .ServiceName }}"
+    destination_service_id = "${POD_NAME}-{{ .ServiceName }}"
     {{- if (gt .ServicePort 0) }}
     local_service_address = "127.0.0.1"
     local_service_port = {{ .ServicePort }}
@@ -270,6 +292,17 @@ EOF
 {{- end }}
 {{- if .AuthMethod }}
 /bin/consul login -method="{{ .AuthMethod }}" \
+	{{- if .CertVolume }}
+	{{- if .EnvoyCAFile }}
+	-ca-file="/consul/connect-inject/tls/ca.crt" \
+	{{- end }}
+	{{- if .EnvoyClientCert }}
+	-client-cert="/consul/connect-inject/tls/tls.crt" \
+	{{- end }} 
+	{{- if .EnvoyClientKey }}
+	-client-key="/consul/connect-inject/tls/tls.key" \
+	{{- end }} 
+	{{- end }}
   -bearer-token-file="/var/run/secrets/kubernetes.io/serviceaccount/token" \
   -token-sink-file="/consul/connect-inject/acl-token" \
   -meta="pod=${POD_NAMESPACE}/${POD_NAME}"
@@ -278,6 +311,17 @@ EOF
 /bin/consul config write -cas -modify-index 0 \
   {{- if .AuthMethod }}
   -token-file="/consul/connect-inject/acl-token" \
+	{{- end }}
+	{{- if .CertVolume }}
+  {{- if .EnvoyCAFile }}
+  -ca-file="/consul/connect-inject/tls/ca.crt" \
+  {{- end }}
+  {{- if .EnvoyClientCert }}
+  -client-cert="/consul/connect-inject/tls/tls.crt" \
+  {{- end }} 
+  {{- if .EnvoyClientKey }}
+  -client-key="/consul/connect-inject/tls/tls.key" \
+  {{- end }} 
   {{- end }}
   /consul/connect-inject/central-config.hcl || true
 {{- end }}
@@ -285,7 +329,18 @@ EOF
 /bin/consul services register \
   {{- if .AuthMethod }}
   -token-file="/consul/connect-inject/acl-token" \
+	{{- end }}
+	{{- if .CertVolume }}
+  {{- if .EnvoyCAFile }}
+  -ca-file="/consul/connect-inject/tls/ca.crt" \
   {{- end }}
+  {{- if .EnvoyClientCert }}
+  -client-cert="/consul/connect-inject/tls/tls.crt" \
+  {{- end }} 
+  {{- if .EnvoyClientKey }}
+  -client-key="/consul/connect-inject/tls/tls.key" \
+  {{- end }} 
+  {{- end }} 
   /consul/connect-inject/service.hcl
 
 # Generate the envoy bootstrap code
@@ -293,6 +348,17 @@ EOF
   -proxy-id="${POD_NAME}-{{ .ServiceName }}-sidecar-proxy" \
   {{- if .AuthMethod }}
   -token-file="/consul/connect-inject/acl-token" \
+	{{- end }}
+	{{- if .CertVolume }}
+  {{- if .EnvoyCAFile }}
+  -ca-file="/consul/connect-inject/tls/ca.crt" \
+  {{- end }}
+  {{- if .EnvoyClientCert }}
+  -client-cert="/consul/connect-inject/tls/tls.crt" \
+  {{- end }} 
+  {{- if .EnvoyClientKey }}
+  -client-key="/consul/connect-inject/tls/tls.key" \
+  {{- end }} 
   {{- end }}
   -bootstrap > /consul/connect-inject/envoy-bootstrap.yaml
 

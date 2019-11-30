@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/hashicorp/consul-k8s/connect-inject"
+	connectinject "github.com/hashicorp/consul-k8s/connect-inject"
 	"github.com/hashicorp/consul-k8s/helper/cert"
 	"github.com/hashicorp/consul/command/flags"
 	"github.com/hashicorp/go-hclog"
@@ -33,6 +33,10 @@ type Command struct {
 	flagDefaultInject   bool   // True to inject by default
 	flagConsulImage     string // Docker image for Consul
 	flagEnvoyImage      string // Docker image for Envoy
+	flagCertVolume      string // Secret volume in pod namespace with TLS files for Envoy (PEM)
+	flagEnvoyCAFile     string // Name of the CA file in the secret volume
+	flagEnvoyClientCert string // Name of the TLS client cert file in the secret volume
+	flagEnvoyClientKey  string // Name of the TLS key file in the secret volume
 	flagACLAuthMethod   string // Auth Method to use for ACLs, if enabled
 	flagCentralConfig   bool   // True to enable central config injection
 	flagDefaultProtocol string // Default protocol for use with central config
@@ -64,6 +68,17 @@ func (c *Command) init() {
 	c.flagSet.BoolVar(&c.flagCentralConfig, "enable-central-config", false, "Enable central config.")
 	c.flagSet.StringVar(&c.flagDefaultProtocol, "default-protocol", "",
 		"The default protocol to use in central config registrations.")
+	c.flagSet.StringVar(&c.flagCertVolume, "cert-volume", "",
+		"Optional secret volume in the pod namespace for mTLS between Envoy and Consul. "+
+			"Volume must be mounted on the container at \"/consul/connect-inject/tls\".")
+	c.flagSet.StringVar(&c.flagEnvoyCAFile, "envoy-tls-ca", "",
+		"The name of the file in the secret volume mount that contains the CA certificate for Envoy.")
+	c.flagSet.StringVar(&c.flagEnvoyClientCert, "envoy-tls-cert", "",
+		"The name of the file in the secret volume mount that contains the client certificate for "+
+			"Envoy.")
+	c.flagSet.StringVar(&c.flagEnvoyClientKey, "envoy-tls-key", "",
+		"The name of the file in the secret volume mount that contains the client private key for "+
+			"Envoy.")
 	c.help = flags.Usage(help, c.flagSet)
 }
 
@@ -115,6 +130,10 @@ func (c *Command) Run(args []string) int {
 		AuthMethod:        c.flagACLAuthMethod,
 		CentralConfig:     c.flagCentralConfig,
 		DefaultProtocol:   c.flagDefaultProtocol,
+		CertVolume:        c.flagCertVolume,
+		EnvoyCAFile:       c.flagEnvoyCAFile,
+		EnvoyClientCert:   c.flagEnvoyClientCert,
+		EnvoyClientKey:    c.flagEnvoyClientKey,
 		Log:               hclog.Default().Named("handler"),
 	}
 	mux := http.NewServeMux()
