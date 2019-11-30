@@ -1,6 +1,8 @@
 package connectinject
 
 import (
+	"fmt"
+
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -24,7 +26,31 @@ func (h *Handler) containerVolume() corev1.Volume {
 func (h *Handler) envoySecretVolume(volName, caFile, certFile, keyFile string) corev1.Volume {
 
 	items := []corev1.KeyToPath{}
-	vol := corev1.Volume{
+
+	if caFile != "" {
+		h.Log.Debug(fmt.Sprintf("TLS secret volume: CA file set to %s", caFile))
+		items = append(items, corev1.KeyToPath{
+			Key:  caFile,
+			Path: "ca.crt",
+		})
+	}
+
+	if certFile != "" {
+		h.Log.Debug(fmt.Sprintf("TLS secret volume: Cert file set to %s", certFile))
+		items = append(items, corev1.KeyToPath{
+			Key:  certFile,
+			Path: "tls.crt",
+		})
+	}
+
+	if keyFile != "" {
+		h.Log.Debug(fmt.Sprintf("TLS secret volume: Key file set to %s", keyFile))
+		items = append(items, corev1.KeyToPath{
+			Key:  keyFile,
+			Path: "tls.key",
+		})
+	}
+	return corev1.Volume{
 		Name: volName,
 		VolumeSource: corev1.VolumeSource{
 			Secret: &corev1.SecretVolumeSource{
@@ -33,27 +59,4 @@ func (h *Handler) envoySecretVolume(volName, caFile, certFile, keyFile string) c
 			},
 		},
 	}
-
-	if caFile != "" {
-		items = append(items, corev1.KeyToPath{
-			Key:  caFile,
-			Path: "/consul/connect-inject/ca.crt",
-		})
-	}
-
-	if certFile != "" {
-		items = append(items, corev1.KeyToPath{
-			Key:  certFile,
-			Path: "/consul/connect-inject/tls.crt",
-		})
-	}
-
-	if keyFile != "" {
-		items = append(items, corev1.KeyToPath{
-			Key:  keyFile,
-			Path: "/consul/connect-inject/tls.key",
-		})
-	}
-
-	return vol
 }

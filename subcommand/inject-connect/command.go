@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,13 +34,10 @@ type Command struct {
 	flagDefaultInject   bool   // True to inject by default
 	flagConsulImage     string // Docker image for Consul
 	flagEnvoyImage      string // Docker image for Envoy
-	flagCertVolume      string // Secret volume in pod namespace with TLS files for Envoy (PEM)
-	flagEnvoyCAFile     string // Name of the CA file in the secret volume
-	flagEnvoyClientCert string // Name of the TLS client cert file in the secret volume
-	flagEnvoyClientKey  string // Name of the TLS key file in the secret volume
 	flagACLAuthMethod   string // Auth Method to use for ACLs, if enabled
 	flagCentralConfig   bool   // True to enable central config injection
 	flagDefaultProtocol string // Default protocol for use with central config
+	flagLogLevel        string // Log level
 	flagSet             *flag.FlagSet
 
 	once sync.Once
@@ -68,17 +66,9 @@ func (c *Command) init() {
 	c.flagSet.BoolVar(&c.flagCentralConfig, "enable-central-config", false, "Enable central config.")
 	c.flagSet.StringVar(&c.flagDefaultProtocol, "default-protocol", "",
 		"The default protocol to use in central config registrations.")
-	c.flagSet.StringVar(&c.flagCertVolume, "cert-volume", "",
-		"Optional secret volume in the pod namespace for mTLS between Envoy and Consul. "+
-			"Volume must be mounted on the container at \"/consul/connect-inject/tls\".")
-	c.flagSet.StringVar(&c.flagEnvoyCAFile, "envoy-tls-ca", "",
-		"The name of the file in the secret volume mount that contains the CA certificate for Envoy.")
-	c.flagSet.StringVar(&c.flagEnvoyClientCert, "envoy-tls-cert", "",
-		"The name of the file in the secret volume mount that contains the client certificate for "+
-			"Envoy.")
-	c.flagSet.StringVar(&c.flagEnvoyClientKey, "envoy-tls-key", "",
-		"The name of the file in the secret volume mount that contains the client private key for "+
-			"Envoy.")
+	c.flagSet.StringVar(&c.flagLogLevel, "log-level", "info",
+		"Log verbosity level. Supported values (in order of detail) are \"trace\", "+
+			"\"debug\", \"info\", \"warn\", and \"error\".")
 	c.help = flags.Usage(help, c.flagSet)
 }
 
@@ -99,6 +89,16 @@ func (c *Command) Run(args []string) int {
 		c.UI.Error(fmt.Sprintf("Error creating K8S client: %s", err))
 		return 1
 	}
+
+	level := hclog.LevelFromString(c.flagLogLevel)
+	if level == hclog.NoLevel {
+		c.UI.Error(fmt.Sprintf("Unknown log level: %s", c.flagLogLevel))
+		return 1
+	}
+	logger := hclog.New(&hclog.LoggerOptions{
+		Level:  level,
+		Output: os.Stderr,
+	})
 
 	// Determine where to source the certificates from
 	var certSource cert.Source = &cert.GenSource{
@@ -130,11 +130,7 @@ func (c *Command) Run(args []string) int {
 		AuthMethod:        c.flagACLAuthMethod,
 		CentralConfig:     c.flagCentralConfig,
 		DefaultProtocol:   c.flagDefaultProtocol,
-		CertVolume:        c.flagCertVolume,
-		EnvoyCAFile:       c.flagEnvoyCAFile,
-		EnvoyClientCert:   c.flagEnvoyClientCert,
-		EnvoyClientKey:    c.flagEnvoyClientKey,
-		Log:               hclog.Default().Named("handler"),
+		Log:               logger,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/mutate", injector.Handle)

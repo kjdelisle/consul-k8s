@@ -3,6 +3,7 @@ package connectinject
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"text/template"
 
@@ -15,16 +16,17 @@ type initContainerCommandData struct {
 	// ServiceProtocol is the protocol for the service-defaults config
 	// that will be written if CentralConfig is true. If empty, Consul
 	// will default to "tcp".
-	ServiceProtocol string
-	AuthMethod      string
-	CentralConfig   bool
-	Upstreams       []initContainerCommandUpstreamData
-	Tags            string
-	Meta            map[string]string
-	CertVolume      string // Secret volume to mount to the pod (must exist within the pod namespace).
-	EnvoyCAFile     string // CA cert filename within the secret volume.
-	EnvoyClientCert string // TLS client cert filename within the secret volume.
-	EnvoyClientKey  string // TLS client key filename within the secret volume.
+	ServiceProtocol    string
+	AuthMethod         string
+	CentralConfig      bool
+	Upstreams          []initContainerCommandUpstreamData
+	Tags               string
+	Meta               map[string]string
+	EnvoyCertVolume    string // Secret volume to mount to the pod (must exist within the pod namespace).
+	EnvoyCAFile        string // CA cert filename within the secret volume.
+	EnvoyClientCert    string // TLS client cert filename within the secret volume.
+	EnvoyClientKey     string // TLS client key filename within the secret volume.
+	EnvoyTLSServerName string // Optional SNI name for TLS connection to Consul agent.
 }
 
 type initContainerCommandUpstreamData struct {
@@ -42,14 +44,15 @@ func (h *Handler) containerInit(pod *corev1.Pod) (corev1.Container, error) {
 		protocol = annoProtocol
 	}
 	data := initContainerCommandData{
-		ServiceName:     pod.Annotations[annotationService],
-		ServiceProtocol: protocol,
-		AuthMethod:      h.AuthMethod,
-		CertVolume:      h.CertVolume,
-		EnvoyCAFile:     h.EnvoyCAFile,
-		EnvoyClientCert: h.EnvoyClientCert,
-		EnvoyClientKey:  h.EnvoyClientKey,
-		CentralConfig:   h.CentralConfig,
+		ServiceName:        pod.Annotations[annotationService],
+		ServiceProtocol:    protocol,
+		AuthMethod:         h.AuthMethod,
+		EnvoyCertVolume:    h.EnvoyCertVolume,
+		EnvoyCAFile:        h.EnvoyCAFile,
+		EnvoyClientCert:    h.EnvoyClientCert,
+		EnvoyClientKey:     h.EnvoyClientKey,
+		EnvoyTLSServerName: h.EnvoyTLSServerName,
+		CentralConfig:      h.CentralConfig,
 	}
 	if data.ServiceName == "" {
 		// Assertion, since we call defaultAnnotations above and do
@@ -129,6 +132,7 @@ func (h *Handler) containerInit(pod *corev1.Pod) (corev1.Container, error) {
 		corev1.VolumeMount{
 			Name:      volumeName,
 			MountPath: "/consul/connect-inject",
+			ReadOnly:  false,
 		},
 	}
 
@@ -143,13 +147,14 @@ func (h *Handler) containerInit(pod *corev1.Pod) (corev1.Container, error) {
 		volMounts = append(volMounts, saTokenVolumeMount)
 	}
 
-	if h.CertVolume != "" {
-		certVolumeMount, err := findCertSecretVolumeMount(pod, h.CertVolume)
-		if err != nil {
-			return corev1.Container{}, err
-		}
-
-		volMounts = append(volMounts, certVolumeMount)
+	if h.EnvoyCertVolume != "" {
+		mountPath := "/consul/connect-inject/tls"
+		h.Log.Debug(fmt.Sprintf("Mounting volume \"%s\" at path: %s", h.EnvoyCertVolume, mountPath))
+		volMounts = append(volMounts, corev1.VolumeMount{
+			Name:      h.EnvoyCertVolume,
+			MountPath: mountPath,
+			ReadOnly:  true,
+		})
 	}
 
 	// Render the command
@@ -160,7 +165,8 @@ func (h *Handler) containerInit(pod *corev1.Pod) (corev1.Container, error) {
 	if err != nil {
 		return corev1.Container{}, err
 	}
-
+	assembledTemplate := buf.String()
+	h.Log.Debug(fmt.Sprintf("Assembled template: \n%s", assembledTemplate))
 	return corev1.Container{
 		Name:  "consul-connect-inject-init",
 		Image: h.ImageConsul,
@@ -191,23 +197,29 @@ func (h *Handler) containerInit(pod *corev1.Pod) (corev1.Container, error) {
 			},
 		},
 		VolumeMounts: volMounts,
-		Command:      []string{"/bin/sh", "-ec", buf.String()},
+		Command:      []string{"/bin/sh", "-ec", assembledTemplate},
 	}, nil
 }
 
 // initContainerCommandTpl is the template for the command executed by
 // the init container.
 const initContainerCommandTpl = `
-{{- if .CertVolume }}
+{{- if .EnvoyCertVolume }}
+echo "Using TLS mode"
 export CONSUL_HTTP_ADDR="https://${HOST_IP}:8501"
 export CONSUL_GRPC_ADDR="https://${HOST_IP}:8502"
+{{- if .EnvoyTLSServerName }}
+export CONSUL_TLS_SERVER_NAME="{{ .EnvoyTLSServerName }}"
+{{- end }}
 {{- else }}
+echo "Using default mode"
 export CONSUL_HTTP_ADDR="${HOST_IP}:8500"
 export CONSUL_GRPC_ADDR="${HOST_IP}:8502"
 {{- end }}
 
 # Register the service. The HCL is stored in the volume so that
 # the preStop hook can access it to deregister the service.
+echo "Creating /consul/connect-inject/service.hcl"
 cat <<EOF >/consul/connect-inject/service.hcl
 services {
   id   = "${POD_NAME}-{{ .ServiceName }}-sidecar-proxy"
@@ -282,86 +294,93 @@ services {
 }
 EOF
 
+
 {{- if .CentralConfig }}
+echo "Creating Central Config service registration"
 # Create the central config's service registration
-cat <<EOF >/consul/connect-inject/central-config.hcl
+cat <<EOF > /consul/connect-inject/central-config.hcl
 kind = "service-defaults"
 name = "{{ .ServiceName }}"
 protocol = "{{ .ServiceProtocol }}"
 EOF
 {{- end }}
 {{- if .AuthMethod }}
+echo "Logging into Consul"
 /bin/consul login -method="{{ .AuthMethod }}" \
-	{{- if .CertVolume }}
+	{{- if .EnvoyCertVolume }}
 	{{- if .EnvoyCAFile }}
 	-ca-file="/consul/connect-inject/tls/ca.crt" \
 	{{- end }}
 	{{- if .EnvoyClientCert }}
 	-client-cert="/consul/connect-inject/tls/tls.crt" \
-	{{- end }} 
+	{{- end }}
 	{{- if .EnvoyClientKey }}
 	-client-key="/consul/connect-inject/tls/tls.key" \
-	{{- end }} 
+	{{- end }}
 	{{- end }}
   -bearer-token-file="/var/run/secrets/kubernetes.io/serviceaccount/token" \
   -token-sink-file="/consul/connect-inject/acl-token" \
   -meta="pod=${POD_NAMESPACE}/${POD_NAME}"
 {{- end }}
 {{- if .CentralConfig }}
+echo "Writing CentralConfig to Consul"
 /bin/consul config write -cas -modify-index 0 \
   {{- if .AuthMethod }}
   -token-file="/consul/connect-inject/acl-token" \
 	{{- end }}
-	{{- if .CertVolume }}
+	{{- if .EnvoyCertVolume }}
   {{- if .EnvoyCAFile }}
   -ca-file="/consul/connect-inject/tls/ca.crt" \
   {{- end }}
   {{- if .EnvoyClientCert }}
   -client-cert="/consul/connect-inject/tls/tls.crt" \
-  {{- end }} 
+  {{- end }}
   {{- if .EnvoyClientKey }}
   -client-key="/consul/connect-inject/tls/tls.key" \
-  {{- end }} 
+  {{- end }}
   {{- end }}
   /consul/connect-inject/central-config.hcl || true
 {{- end }}
 
+echo "Registering service with Consul"
 /bin/consul services register \
   {{- if .AuthMethod }}
   -token-file="/consul/connect-inject/acl-token" \
 	{{- end }}
-	{{- if .CertVolume }}
-  {{- if .EnvoyCAFile }}
+	{{- if .EnvoyCertVolume }}
+	{{- if .EnvoyCAFile }}
   -ca-file="/consul/connect-inject/tls/ca.crt" \
   {{- end }}
   {{- if .EnvoyClientCert }}
   -client-cert="/consul/connect-inject/tls/tls.crt" \
-  {{- end }} 
+  {{- end }}
   {{- if .EnvoyClientKey }}
   -client-key="/consul/connect-inject/tls/tls.key" \
-  {{- end }} 
-  {{- end }} 
+  {{- end }}
+  {{- end }}
   /consul/connect-inject/service.hcl
 
 # Generate the envoy bootstrap code
+echo "Generating Envoy bootstrap configuration"
 /bin/consul connect envoy \
   -proxy-id="${POD_NAME}-{{ .ServiceName }}-sidecar-proxy" \
   {{- if .AuthMethod }}
   -token-file="/consul/connect-inject/acl-token" \
-	{{- end }}
-	{{- if .CertVolume }}
+  {{- end }}
+  {{- if .EnvoyCertVolume }}
   {{- if .EnvoyCAFile }}
   -ca-file="/consul/connect-inject/tls/ca.crt" \
   {{- end }}
   {{- if .EnvoyClientCert }}
   -client-cert="/consul/connect-inject/tls/tls.crt" \
-  {{- end }} 
+  {{- end }}
   {{- if .EnvoyClientKey }}
   -client-key="/consul/connect-inject/tls/tls.key" \
-  {{- end }} 
+  {{- end }}
   {{- end }}
   -bootstrap > /consul/connect-inject/envoy-bootstrap.yaml
 
 # Copy the Consul binary
+echo "Copying binary to /consul/connect-inject/consul"
 cp /bin/consul /consul/connect-inject/consul
 `

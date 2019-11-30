@@ -9,11 +9,12 @@ import (
 )
 
 type containerSidecarCommandData struct {
-	AuthMethod      string
-	CertVolume      string // Secret volume to mount to the pod (must exist within the pod namespace).
-	EnvoyCAFile     string // CA cert filename within the secret volume.
-	EnvoyClientCert string // TLS client cert filename within the secret volume.
-	EnvoyClientKey  string // TLS client key filename within the secret volume.
+	AuthMethod         string
+	EnvoyCertVolume    string // Secret volume to mount to the pod (must exist within the pod namespace).
+	EnvoyCAFile        string // CA cert filename within the secret volume.
+	EnvoyClientCert    string // TLS client cert filename within the secret volume.
+	EnvoyClientKey     string // TLS client key filename within the secret volume.
+	EnvoyTLSServerName string // TLS Server Name (SNI) for connecting to Consul.
 }
 
 func (h *Handler) containerSidecar(pod *corev1.Pod) (corev1.Container, error) {
@@ -23,11 +24,25 @@ func (h *Handler) containerSidecar(pod *corev1.Pod) (corev1.Container, error) {
 	tpl := template.Must(template.New("root").Parse(strings.TrimSpace(
 		sidecarPreStopCommandTpl)))
 	err := tpl.Execute(&buf, containerSidecarCommandData{
-		AuthMethod: h.AuthMethod,
-		CertVolume: h.CertVolume,
+		AuthMethod:      h.AuthMethod,
+		EnvoyCertVolume: h.EnvoyCertVolume,
 	})
 	if err != nil {
 		return corev1.Container{}, err
+	}
+
+	volMounts := []corev1.VolumeMount{
+		corev1.VolumeMount{
+			Name:      volumeName,
+			MountPath: "/consul/connect-inject",
+		},
+	}
+
+	if h.EnvoyCertVolume != "" {
+		volMounts = append(volMounts, corev1.VolumeMount{
+			Name:      h.EnvoyCertVolume,
+			MountPath: "/consul/connect-inject/tls",
+		})
 	}
 
 	return corev1.Container{
@@ -41,12 +56,7 @@ func (h *Handler) containerSidecar(pod *corev1.Pod) (corev1.Container, error) {
 				},
 			},
 		},
-		VolumeMounts: []corev1.VolumeMount{
-			corev1.VolumeMount{
-				Name:      volumeName,
-				MountPath: "/consul/connect-inject",
-			},
-		},
+		VolumeMounts: volMounts,
 		Lifecycle: &corev1.Lifecycle{
 			PreStop: &corev1.Handler{
 				Exec: &corev1.ExecAction{
@@ -67,8 +77,11 @@ func (h *Handler) containerSidecar(pod *corev1.Pod) (corev1.Container, error) {
 }
 
 const sidecarPreStopCommandTpl = `
-{{- if .CertVolume }}
-export CONSUL_HTTP_ADDR="${HOST_IP}:8501"
+{{- if .EnvoyCertVolume }}
+export CONSUL_HTTP_ADDR="https://${HOST_IP}:8501"
+{{- if .EnvoyTLSServerName }}
+export CONSUL_TLS_SERVER_NAME="{{ .EnvoyTLSServerName }}"
+{{- end }}
 {{- else }}
 export CONSUL_HTTP_ADDR="${HOST_IP}:8500"
 {{- end }}
@@ -76,7 +89,7 @@ export CONSUL_HTTP_ADDR="${HOST_IP}:8500"
   {{- if .AuthMethod }}
   -token-file="/consul/connect-inject/acl-token" \
   {{- end }}
-  {{- if .CertVolume }}
+  {{- if .EnvoyCertVolume }}
   {{- if .EnvoyCAFile }}
   -ca-file="/consul/connect-inject/tls/ca.crt" \
   {{- end }}
@@ -90,7 +103,7 @@ export CONSUL_HTTP_ADDR="${HOST_IP}:8500"
   /consul/connect-inject/service.hcl
 {{- if .AuthMethod }}
 && /consul/connect-inject/consul logout \
-{{- if .CertVolume }}
+{{- if .EnvoyCertVolume }}
 {{- if .EnvoyCAFile }}
   -ca-file="/consul/connect-inject/tls/ca.crt" \
 {{- end }}

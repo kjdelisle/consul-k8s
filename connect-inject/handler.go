@@ -70,6 +70,18 @@ const (
 	// registration. This is specified in the format `<key>:<value>`
 	// e.g. consul.hashicorp.com/service-meta-foo:bar
 	annotationMeta = "consul.hashicorp.com/service-meta-"
+
+	// The name of the certificate volume (must be available in the pod's namespace)
+	annotationCertVolume = "consul.hashicorp.com/certificate-volume"
+	// The name of the CA cert file in the volume, if available. Will be mapped to "ca.crt"
+	annotationCACert = "consul.hashicorp.com/ca-file"
+	// The name of the client cert file in the volume, if available. Will be mapped to "tls.crt"
+	annotationClientCert = "consul.hashicorp.com/client-cert"
+	// The name of the private key in the volume, if available. Will be mapped to "tls.key"
+	annotationClientKey = "consul.hashicorp.com/client-key"
+
+	// The SNI name to use when connecting with the Consul agent.
+	annotationTLSServerName = "consul.hashicorp.com/tls-server-name"
 )
 
 var (
@@ -111,10 +123,11 @@ type Handler struct {
 	DefaultProtocol string
 
 	// Envoy certificate materials used for connecting to Consul (paths to PEM-encoded files)
-	CertVolume      string // Secret volume to mount to the pod (must exist within the pod namespace).
-	EnvoyCAFile     string // CA cert filename within the secret volume.
-	EnvoyClientCert string // TLS client cert filename within the secret volume.
-	EnvoyClientKey  string // TLS client key filename within the secret volume.
+	EnvoyCertVolume    string // Certificate volume mount to use with our pods.
+	EnvoyCAFile        string // CA cert filename within the secret volume.
+	EnvoyClientCert    string // TLS client cert filename within the secret volume.
+	EnvoyClientKey     string // TLS client key filename within the secret volume.
+	EnvoyTLSServerName string // TLS Server name (SNI) to use when connecting with Consul agent.
 
 	// Log
 	Log hclog.Logger
@@ -224,11 +237,35 @@ func (h *Handler) Mutate(req *v1beta1.AdmissionRequest) *v1beta1.AdmissionRespon
 		[]corev1.Volume{h.containerVolume()},
 		"/spec/volumes")...)
 
-	if h.CertVolume != "" {
+	// If we have a cert volume annotation, check for the others and assign them.
+	if pod.Annotations[annotationCertVolume] != "" {
+		h.EnvoyCertVolume = pod.Annotations[annotationCertVolume]
+		h.Log.Debug(fmt.Sprintf("Envoy certificate volume: %s", h.EnvoyCertVolume))
+
+		if pod.Annotations[annotationCACert] != "" {
+			h.EnvoyCAFile = pod.Annotations[annotationCACert]
+			h.Log.Debug(fmt.Sprintf("CA certificate file: %s", h.EnvoyCAFile))
+		}
+
+		if pod.Annotations[annotationClientCert] != "" {
+			h.EnvoyClientCert = pod.Annotations[annotationClientCert]
+			h.Log.Debug(fmt.Sprintf("Client certificate file: %s", h.EnvoyClientCert))
+		}
+
+		if pod.Annotations[annotationClientKey] != "" {
+			h.EnvoyClientKey = pod.Annotations[annotationClientKey]
+			h.Log.Debug(fmt.Sprintf("Client private key file: %s", h.EnvoyClientKey))
+		}
+
+		if pod.Annotations[annotationTLSServerName] != "" {
+			h.EnvoyTLSServerName = pod.Annotations[annotationTLSServerName]
+			h.Log.Debug(fmt.Sprintf("TLS Server name set to: %s", h.EnvoyTLSServerName))
+		}
+		// Mount the volume with whatever values have been set.
 		patches = append(patches, addVolume(
 			pod.Spec.Volumes,
 			[]corev1.Volume{
-				h.envoySecretVolume(h.CertVolume,
+				h.envoySecretVolume(h.EnvoyCertVolume,
 					h.EnvoyCAFile,
 					h.EnvoyClientCert,
 					h.EnvoyClientKey),
@@ -440,40 +477,6 @@ func findServiceAccountVolumeMount(pod *corev1.Pod) (corev1.VolumeMount, error) 
 	// Return an error if volumeMount is still empty
 	if (corev1.VolumeMount{}) == volumeMount {
 		return volumeMount, errors.New("Unable to find service account token volumeMount")
-	}
-
-	return volumeMount, nil
-}
-
-func findCertSecretVolumeMount(pod *corev1.Pod, volName string) (corev1.VolumeMount, error) {
-	var volumeMount corev1.VolumeMount
-	var volume corev1.Volume
-	for _, v := range pod.Spec.Volumes {
-		// Check if the volume is a Secret or a ConfigMap
-		// (ConfigMap could still make sense if they're only mounting a CA cert...)
-		if v.Secret != nil && v.Secret.SecretName == volName {
-			volume = v
-			break
-		} else if v.ConfigMap != nil && v.ConfigMap.Name == volName {
-			volume = v
-			break
-		}
-	}
-	for _, container := range pod.Spec.Containers {
-		for _, vm := range container.VolumeMounts {
-			if vm.MountPath == "/consul/connect-inject/tls" {
-				volumeMount = vm
-				break
-			}
-		}
-	}
-
-	if (corev1.Volume{}) == volume {
-		return volumeMount, errors.New("Unable to find TLS volume for Connect on the Pod specification")
-	}
-
-	if (corev1.VolumeMount{}) == volumeMount {
-		return volumeMount, errors.New("Unable to find TLS mount for Connect on the Pod containers")
 	}
 
 	return volumeMount, nil
